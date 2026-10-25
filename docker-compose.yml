@@ -1,0 +1,11 @@
+services:
+  alumni-platform:
+    build: .
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - PESU_CACHE_TTL=3600
+      - PESU_DEBUG=false
+    restart: unless-stopped
