@@ -1,0 +1,175 @@
+import pandas as pd
+import json
+import time
+import os
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
+# ==============================
+# SELECT THE RANGE TO SCRAPE
+# ==============================
+START = 151     # Starting row (0-based)
+END = 160     # Ending row (exclusive)
+
+# 1. Load Excel Sheet
+excel_file = "Class of 2026-LinkedIn Profiles copy.xlsx"
+if not os.path.exists(excel_file):
+    print(f"❌ Error: Cannot find '{excel_file}' in this folder!")
+    exit()
+
+df = pd.read_excel(excel_file)
+output_file = f"selenium_scraped_alumni_full_{START}_{END}.jsonl"
+
+# 2. Setup Automated Chrome Browser
+print("🤖 Launching Chrome...")
+options = webdriver.ChromeOptions()
+options.add_argument("--disable-blink-features=AutomationControlled")
+options.add_argument("--start-maximized")
+
+driver = webdriver.Chrome(options=options)
+
+# 3. Manual Login Stopover
+print("\n🔒 Opening LinkedIn. PLEASE LOG IN MANUALLY NOW!")
+driver.get("https://www.linkedin.com/login")
+
+for seconds_left in range(120, 0, -1):
+    print(f"⏱️ Waiting for your manual login... {seconds_left}s remaining", end="\r")
+    time.sleep(1)
+
+print(f"\n🚀 Starting deep extraction for rows {START} to {END-1}...\n")
+batch_size = END - START
+
+
+def expand_page_content(driver):
+    """Scrolls down to trigger lazy loading and clicks all 'Show details' / 'See more' buttons."""
+    # Scroll in increments to trigger lazy-loaded sections
+    for i in range(1, 6):
+        driver.execute_script(f"window.scrollTo(0, document.body.scrollHeight * {i/5});")
+        time.sleep(1.5)
+
+    # Click all expanders ("See more", "Show all", inline expansion buttons)
+    expand_xpaths = [
+        "//button[contains(@class, 'inline-show-more-text__button')]",
+        "//button[contains(@aria-label, 'Expand')]",
+        "//button[contains(@aria-label, 'see more')]",
+        "//button[contains(., 'See more')]"
+    ]
+    
+    for xpath in expand_xpaths:
+        try:
+            buttons = driver.find_elements(By.XPATH, xpath)
+            for btn in buttons:
+                if btn.is_displayed():
+                    driver.execute_script("arguments[0].click();", btn)
+                    time.sleep(0.3)
+        except Exception:
+            pass
+
+
+def extract_section_items(driver, section_id):
+    """Helper to extract structured text items from target profile sections."""
+    items = []
+    try:
+        # Find section by ID container or header text
+        section = driver.find_element(By.XPATH, f"//section[.//div[@id='{section_id}'] or .//span[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{section_id}')]]")
+        
+        # Extract list items within section
+        list_elements = section.find_elements(By.XPATH, ".//li[contains(@class, 'artdeco-list__item')]")
+        
+        for el in list_elements:
+            text = el.text.strip()
+            if text:
+                items.append(text)
+    except Exception:
+        pass
+    return items
+
+
+# 4. Main Extraction Loop
+with open(output_file, "w", encoding="utf-8") as f:
+    for count, (index, row) in enumerate(df.iloc[START:END].iterrows(), start=1):
+
+        name = str(row.get('Name', '')).strip()
+        url = str(row.get('LinkedIn Profile Link', '')).strip()
+        srn = str(row.get('SRN', '')).strip()
+
+        if url in ["No Link Provided", "Na", "nan"] or not url.startswith("http"):
+            print(f"⏩ [{count}/{batch_size}] Skipping {name} (Invalid Link)")
+            continue
+
+        print(f"🌐 [{count}/{batch_size}] Scraper active on: {name} (Row {index+1})...")
+
+        try:
+            driver.get(url)
+            time.sleep(5)
+
+            # Auto scroll and expand all collapsed sections
+            expand_page_content(driver)
+
+            # --- TOP CARD DETAILS ---
+            top_card_text = ""
+            try:
+                top_card = driver.find_element(By.XPATH, "//main//section[1]")
+                top_card_text = top_card.text.strip()
+            except Exception:
+                pass
+
+            # --- ABOUT SECTION ---
+            about_text = ""
+            try:
+                about_sec = driver.find_element(By.XPATH, "//section[.//div[@id='about']]")
+                about_text = about_sec.text.replace("About\n", "").strip()
+            except Exception:
+                pass
+
+            # --- EXPERIENCE SECTION ---
+            experiences = extract_section_items(driver, "experience")
+
+            # --- EDUCATION SECTION ---
+            education = extract_section_items(driver, "education")
+
+            # --- SKILLS SECTION ---
+            skills = extract_section_items(driver, "skills")
+
+            # --- CERTIFICATIONS SECTION ---
+            certifications = extract_section_items(driver, "licenses_and_certifications")
+
+            # --- PROJECTS SECTION ---
+            projects = extract_section_items(driver, "projects")
+
+            # --- FULL RAW BODY BACKUP ---
+            # Guaranteed fallback: captures entire main page text structure
+            raw_page_text = ""
+            try:
+                raw_page_text = driver.find_element(By.XPATH, "//main").text.strip()
+            except Exception:
+                pass
+
+            # Construct Comprehensive Profile Payload
+            profile_data = {
+                "name": name,
+                "srn": srn,
+                "linkedin_url": url,
+                "top_card_raw": top_card_text,
+                "about": about_text,
+                "experiences": experiences,
+                "education": education,
+                "skills": skills,
+                "certifications": certifications,
+                "projects": projects,
+                "full_page_text": raw_page_text  # Guarantees zero missed text
+            }
+
+            f.write(json.dumps(profile_data, ensure_ascii=False) + "\n")
+            print(f"   🔥 Extracted full profile! Experience count: {len(experiences)} | Skills count: {len(skills)}")
+
+        except Exception as e:
+            print(f"   ⚠️ Error processing page for {name}: {e}")
+
+        print("⏳ Waiting to simulate human interaction...")
+        time.sleep(8)
+
+driver.quit()
+print(f"\n✅ Scraping finished! Comprehensive data saved to '{output_file}'")
